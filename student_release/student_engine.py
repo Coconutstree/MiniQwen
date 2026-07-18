@@ -101,6 +101,7 @@ class StudentEngine:
         self.rope_theta = float(self.config.get("rope_theta", 10000.0))
         self.eos_token_id = int(self.config.get("eos_token_id", self.tokenizer.eos_token_id or 0))
         self.bos_token_id = self.config.get("bos_token_id", self.tokenizer.bos_token_id)
+        self.batch_length_ratio = 1.6
         self.inv_freq = 1.0 / (
             self.rope_theta
             ** (
@@ -117,18 +118,34 @@ class StudentEngine:
         suite_name: str | None = None,
     ) -> list[str]:
         del suite_name
-        return [self._generate_one(str(prompt), int(max_new_tokens)) for prompt in prompts]
+        if not prompts:
+            return []
+        return self._generate_length_aware(
+            [str(prompt) for prompt in prompts],
+            int(max_new_tokens),
+            max(int(batch_size or 1), 1),
+        )
 
     def serve_requests(self, requests: list[dict], batch_size: int | None = None):
-        del batch_size
-        outputs: list[str] = []
-        for request in requests:
-            outputs.append(
-                self._generate_one(
-                    str(request.get("prompt", "")),
-                    int(request.get("max_new_tokens", 1)),
-                )
+        if not requests:
+            return []
+
+        grouped: dict[int, list[tuple[int, str]]] = {}
+        for index, request in enumerate(requests):
+            token_budget = int(request.get("max_new_tokens", 1))
+            grouped.setdefault(token_budget, []).append((index, str(request.get("prompt", ""))))
+
+        outputs = [""] * len(requests)
+        for token_budget, items in grouped.items():
+            effective_batch_size = max(int(batch_size or len(items) or 1), 1)
+            prompts = [prompt for _, prompt in items]
+            chunk_outputs = self._generate_length_aware(
+                prompts,
+                token_budget,
+                effective_batch_size,
             )
+            for (original_index, _), generated_text in zip(items, chunk_outputs):
+                outputs[original_index] = generated_text
         return outputs
 
     def _weight(self, name_key: str) -> torch.Tensor:
@@ -208,6 +225,22 @@ class StudentEngine:
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         return torch.matmul(probs, v)
 
+    def _batch_decode_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        valid_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
+        scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+        positions = torch.arange(k.shape[2], device=self.device).view(1, 1, 1, -1)
+        invalid = positions >= valid_lengths.view(-1, 1, 1, 1)
+        scores = scores.masked_fill(invalid, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        return torch.matmul(probs, v)
+
     def _self_attention(
         self,
         hidden_states: torch.Tensor,
@@ -256,6 +289,41 @@ class StudentEngine:
         gate = self._linear(hidden_states, f"{prefix}.gate_proj.weight")
         up = self._linear(hidden_states, f"{prefix}.up_proj.weight")
         return self._linear(F.silu(gate) * up, f"{prefix}.down_proj.weight")
+
+    def _self_attention_batch_decode(
+        self,
+        hidden_states: torch.Tensor,
+        layer_index: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        layer_cache: tuple[torch.Tensor, torch.Tensor],
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        prefix = f"model.layers.{layer_index}.self_attn"
+        batch_size, seq_len, _ = hidden_states.shape
+        q = self._linear(hidden_states, f"{prefix}.q_proj.weight", f"{prefix}.q_proj.bias")
+        k = self._linear(hidden_states, f"{prefix}.k_proj.weight", f"{prefix}.k_proj.bias")
+        v = self._linear(hidden_states, f"{prefix}.v_proj.weight", f"{prefix}.v_proj.bias")
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = self._apply_rope(q, k, cos, sin)
+
+        key_cache, value_cache = layer_cache
+        batch_indices = torch.arange(batch_size, device=self.device)
+        key_cache[batch_indices, :, lengths, :] = k[:, :, 0, :]
+        value_cache[batch_indices, :, lengths, :] = v[:, :, 0, :]
+
+        valid_lengths = lengths + 1
+        max_valid_length = int(valid_lengths.max().item())
+        full_k = key_cache[:, :, :max_valid_length, :]
+        full_v = value_cache[:, :, :max_valid_length, :]
+
+        attn_output = self._batch_decode_attention(q, full_k, full_v, valid_lengths)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+        return self._linear(attn_output, f"{prefix}.o_proj.weight")
 
     def _forward_tokens(
         self,
@@ -329,16 +397,199 @@ class StudentEngine:
             reserved.append((key_buffer, value_buffer, used_tokens))
         return reserved
 
+    def _prefill_single(
+        self,
+        token_ids: list[int],
+        total_capacity: int,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, int]]]:
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        hidden_states, cache = self._forward_tokens(input_ids, start_position=0, cache=None)
+        return hidden_states, self._reserve_cache(cache, total_capacity)
+
+    def _merge_caches(
+        self,
+        single_caches: list[list[tuple[torch.Tensor, torch.Tensor, int]]],
+        total_capacity: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        batch_size = len(single_caches)
+        merged: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_index in range(self.num_layers):
+            source_key, source_value, _ = single_caches[0][layer_index]
+            key_cache = source_key.new_empty(
+                batch_size,
+                source_key.shape[1],
+                total_capacity,
+                source_key.shape[3],
+            )
+            value_cache = source_value.new_empty(
+                batch_size,
+                source_value.shape[1],
+                total_capacity,
+                source_value.shape[3],
+            )
+            for batch_index, cache in enumerate(single_caches):
+                key_source, value_source, used_tokens = cache[layer_index]
+                key_cache[batch_index, :, :used_tokens, :] = key_source[0, :, :used_tokens, :]
+                value_cache[batch_index, :, :used_tokens, :] = value_source[0, :, :used_tokens, :]
+            merged.append((key_cache, value_cache))
+        return merged
+
     def _next_token(self, hidden_states: torch.Tensor) -> int:
+        return int(self._next_tokens(hidden_states).item())
+
+    def _next_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden_states[:, -1, :], self._weight("model.embed_tokens.weight"))
-        return int(torch.argmax(logits, dim=-1).item())
+        return torch.argmax(logits, dim=-1)
+
+    def _decode_step_batch(
+        self,
+        next_tokens: torch.Tensor,
+        cache: list[tuple[torch.Tensor, torch.Tensor]],
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        input_ids = next_tokens.to(device=self.device, dtype=torch.long).view(-1, 1)
+        positions = lengths.to(device=self.device, dtype=torch.long).view(-1, 1)
+        cos, sin = self._rotary_cos_sin(positions)
+        hidden_states = self._weight("model.embed_tokens.weight")[input_ids]
+
+        for layer_index in range(self.num_layers):
+            residual = hidden_states
+            hidden_states = _rms_norm(
+                hidden_states,
+                self._weight(f"model.layers.{layer_index}.input_layernorm.weight"),
+                self.rms_eps,
+            )
+            attn_output = self._self_attention_batch_decode(
+                hidden_states,
+                layer_index,
+                cos,
+                sin,
+                cache[layer_index],
+                lengths,
+            )
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = _rms_norm(
+                hidden_states,
+                self._weight(f"model.layers.{layer_index}.post_attention_layernorm.weight"),
+                self.rms_eps,
+            )
+            hidden_states = residual + self._mlp(hidden_states, layer_index)
+
+        hidden_states = _rms_norm(hidden_states, self._weight("model.norm.weight"), self.rms_eps)
+        return hidden_states, cache, lengths + 1
 
     @torch.inference_mode()
-    def _generate_one(self, prompt: str, max_new_tokens: int) -> str:
+    def _generate_batch(self, prompts: list[str], max_new_tokens: int) -> list[str]:
+        return self._generate_batch_tokenized(
+            [self._tokenize(prompt) for prompt in prompts],
+            max_new_tokens,
+        )
+
+    def _generate_length_aware(
+        self,
+        prompts: list[str],
+        max_new_tokens: int,
+        preferred_batch_size: int,
+    ) -> list[str]:
+        if not prompts:
+            return []
+        if max_new_tokens <= 0:
+            return [""] * len(prompts)
+
+        items = [
+            (index, self._tokenize(prompt))
+            for index, prompt in enumerate(prompts)
+        ]
+        preferred_batch_size = max(int(preferred_batch_size or 1), 1)
+        if preferred_batch_size <= 1:
+            return [
+                self._generate_single_tokenized(token_ids, max_new_tokens)
+                for _, token_ids in items
+            ]
+
+        outputs = [""] * len(items)
+        sorted_items = sorted(items, key=lambda item: len(item[1]))
+        current: list[tuple[int, list[int]]] = []
+
+        def flush() -> None:
+            if not current:
+                return
+            generated = self._generate_batch_tokenized(
+                [token_ids for _, token_ids in current],
+                max_new_tokens,
+            )
+            for (original_index, _), generated_text in zip(current, generated):
+                outputs[original_index] = generated_text
+            current.clear()
+
+        for item in sorted_items:
+            proposed = current + [item]
+            lengths = [max(len(token_ids), 1) for _, token_ids in proposed]
+            length_ratio = max(lengths) / max(min(lengths), 1)
+            if (
+                current
+                and (
+                    len(proposed) > preferred_batch_size
+                    or length_ratio > self.batch_length_ratio
+                )
+            ):
+                flush()
+            current.append(item)
+        flush()
+        return outputs
+
+    def _generate_batch_tokenized(
+        self,
+        tokenized: list[list[int]],
+        max_new_tokens: int,
+    ) -> list[str]:
+        if not tokenized:
+            return []
+        if max_new_tokens <= 0:
+            return [""] * len(tokenized)
+        if len(tokenized) == 1:
+            return [self._generate_single_tokenized(tokenized[0], max_new_tokens)]
+
+        prompt_lengths = [len(token_ids) for token_ids in tokenized]
+        total_capacity = max(prompt_lengths) + int(max_new_tokens)
+
+        last_hidden_states: list[torch.Tensor] = []
+        single_caches: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
+        for token_ids in tokenized:
+            hidden_states, cache = self._prefill_single(token_ids, total_capacity)
+            last_hidden_states.append(hidden_states[:, -1:, :])
+            single_caches.append(cache)
+
+        cache = self._merge_caches(single_caches, total_capacity)
+        lengths = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
+        next_tokens = self._next_tokens(torch.cat(last_hidden_states, dim=0))
+        generated_ids = [[int(token_id)] for token_id in next_tokens.tolist()]
+
+        for _ in range(max_new_tokens - 1):
+            hidden_states, cache, lengths = self._decode_step_batch(next_tokens, cache, lengths)
+            next_tokens = self._next_tokens(hidden_states)
+            for output_ids, token_id in zip(generated_ids, next_tokens.tolist()):
+                output_ids.append(int(token_id))
+
+        return [
+            self.tokenizer.decode(
+                output_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            for output_ids in generated_ids
+        ]
+
+    def _generate_single(self, prompt: str, max_new_tokens: int) -> str:
+        return self._generate_single_tokenized(self._tokenize(prompt), max_new_tokens)
+
+    def _generate_single_tokenized(self, token_ids: list[int], max_new_tokens: int) -> str:
         if max_new_tokens <= 0:
             return ""
 
-        input_ids = torch.tensor([self._tokenize(prompt)], dtype=torch.long, device=self.device)
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         hidden_states, cache = self._forward_tokens(input_ids, start_position=0, cache=None)
         cache = self._reserve_cache(cache, input_ids.shape[1] + max_new_tokens)
         next_token = self._next_token(hidden_states)
@@ -357,3 +608,7 @@ class StudentEngine:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
+
+    @torch.inference_mode()
+    def _generate_one(self, prompt: str, max_new_tokens: int) -> str:
+        return self._generate_single(prompt, max_new_tokens)
