@@ -109,6 +109,16 @@ class StudentEngine:
                 / self.head_dim
             )
         )
+        self.template_prefix_token_ids = self._build_template_prefix_token_ids()
+        self.batch_prefix_min_tokens = max(128, len(self.template_prefix_token_ids) + 32)
+        self.max_cached_prefix_tokens = min(int(self.config.get("max_position_embeddings", 4096)), 4096)
+        self.max_prefix_cache_entries = 4
+        self.prefix_cache: dict[
+            tuple[int, ...],
+            tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, int]]],
+        ] = {}
+        self.prefix_cache_order: list[tuple[int, ...]] = []
+        self.pinned_prefix_keys: set[tuple[int, ...]] = set()
 
     def generate(
         self,
@@ -130,23 +140,183 @@ class StudentEngine:
         if not requests:
             return []
 
-        grouped: dict[int, list[tuple[int, str]]] = {}
-        for index, request in enumerate(requests):
-            token_budget = int(request.get("max_new_tokens", 1))
-            grouped.setdefault(token_budget, []).append((index, str(request.get("prompt", ""))))
-
         outputs = [""] * len(requests)
-        for token_budget, items in grouped.items():
-            effective_batch_size = max(int(batch_size or len(items) or 1), 1)
-            prompts = [prompt for _, prompt in items]
-            chunk_outputs = self._generate_length_aware(
-                prompts,
-                token_budget,
-                effective_batch_size,
+        pending: list[dict[str, Any]] = []
+        for index, request in enumerate(requests):
+            max_new_tokens = max(int(request.get("max_new_tokens", 1)), 0)
+            if max_new_tokens <= 0:
+                continue
+            prompt = str(request.get("prompt", ""))
+            pending.append(
+                {
+                    "index": index,
+                    "arrival": float(request.get("arrival_time_ms", index * 10.0)),
+                    "priority": int(request.get("priority", 0)),
+                    "group_id": str(request.get("group_id", "")),
+                    "token_ids": self._tokenize(prompt),
+                    "max_new_tokens": max_new_tokens,
+                    "generated_ids": [],
+                    "generated_count": 0,
+                }
             )
-            for (original_index, _), generated_text in zip(items, chunk_outputs):
-                outputs[original_index] = generated_text
+
+        if not pending:
+            return outputs
+
+        max_active = self._serving_max_active(requests, batch_size)
+        pending.sort(key=lambda item: (item["arrival"], -item["priority"], item["index"]))
+        virtual_time_ms = float(pending[0]["arrival"])
+        active: list[dict[str, Any]] = []
+        active_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        active_lengths: torch.Tensor | None = None
+        active_next_tokens: torch.Tensor | None = None
+
+        while pending or active:
+            if not active and pending and float(pending[0]["arrival"]) > virtual_time_ms:
+                virtual_time_ms = float(pending[0]["arrival"])
+
+            slots = max_active - len(active)
+            if slots > 0:
+                arriving, pending = self._pop_arrived_requests(pending, virtual_time_ms, slots)
+                if arriving:
+                    (
+                        admitted,
+                        new_cache,
+                        new_lengths,
+                        new_next_tokens,
+                    ) = self._prefill_serving_requests(arriving, outputs)
+                    if admitted:
+                        active_cache = self._append_active_cache_rows(active_cache, new_cache)
+                        active_lengths = (
+                            new_lengths
+                            if active_lengths is None
+                            else torch.cat((active_lengths, new_lengths), dim=0)
+                        )
+                        active_next_tokens = (
+                            new_next_tokens
+                            if active_next_tokens is None
+                            else torch.cat((active_next_tokens, new_next_tokens), dim=0)
+                        )
+                        active.extend(admitted)
+
+            if not active:
+                continue
+
+            assert active_cache is not None
+            assert active_lengths is not None
+            assert active_next_tokens is not None
+            hidden_states, active_cache, active_lengths = self._decode_step_batch(
+                active_next_tokens,
+                active_cache,
+                active_lengths,
+            )
+            candidate_next_tokens = self._next_tokens(hidden_states)
+
+            keep_positions: list[int] = []
+            next_token_values: list[int] = []
+            for active_position, item in enumerate(active):
+                token_id = int(candidate_next_tokens[active_position].item())
+                item["generated_ids"].append(token_id)
+                item["generated_count"] += 1
+                if int(item["generated_count"]) >= int(item["max_new_tokens"]):
+                    outputs[int(item["index"])] = self._decode_generated_ids(item["generated_ids"])
+                else:
+                    keep_positions.append(active_position)
+                    next_token_values.append(token_id)
+
+            if keep_positions:
+                active = [active[position] for position in keep_positions]
+                active_cache = self._select_active_cache_rows(active_cache, keep_positions)
+                keep_tensor = torch.tensor(keep_positions, dtype=torch.long, device=self.device)
+                active_lengths = active_lengths.index_select(0, keep_tensor)
+                active_next_tokens = torch.tensor(
+                    next_token_values,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            else:
+                active = []
+                active_cache = None
+                active_lengths = None
+                active_next_tokens = None
+
+            virtual_time_ms += 1.0
         return outputs
+
+    def _serving_max_active(self, requests: list[dict], batch_size: int | None) -> int:
+        if batch_size is not None:
+            return max(int(batch_size), 1)
+        stream_size = 0
+        for request in requests:
+            stream_size = max(stream_size, int(request.get("stream_size", 0) or 0))
+        return max(stream_size or len(requests), 1)
+
+    def _pop_arrived_requests(
+        self,
+        pending: list[dict[str, Any]],
+        virtual_time_ms: float,
+        slots: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        arrived = [item for item in pending if float(item["arrival"]) <= virtual_time_ms]
+        if not arrived:
+            return [], pending
+        arrived.sort(
+            key=lambda item: (
+                -int(item["priority"]),
+                str(item["group_id"]),
+                float(item["arrival"]),
+                int(item["index"]),
+            )
+        )
+        selected = arrived[:slots]
+        selected_indices = {int(item["index"]) for item in selected}
+        remaining = [item for item in pending if int(item["index"]) not in selected_indices]
+        remaining.sort(key=lambda item: (item["arrival"], -item["priority"], item["index"]))
+        return selected, remaining
+
+    def _prefill_serving_requests(
+        self,
+        items: list[dict[str, Any]],
+        outputs: list[str],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[list[tuple[torch.Tensor, torch.Tensor, int]]],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        self._prepare_batch_prefix_cache([item["token_ids"] for item in items])
+        admitted: list[dict[str, Any]] = []
+        new_caches: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
+        lengths: list[int] = []
+        next_tokens: list[int] = []
+        for item in items:
+            token_ids = item["token_ids"]
+            max_new_tokens = int(item["max_new_tokens"])
+            hidden_states, cache = self._prefill_single(token_ids, len(token_ids) + max_new_tokens)
+            next_token = self._next_token(hidden_states)
+            item["generated_ids"] = [next_token]
+            item["generated_count"] = 1
+            if max_new_tokens <= 1:
+                outputs[int(item["index"])] = self._decode_generated_ids(item["generated_ids"])
+                continue
+            admitted.append(item)
+            new_caches.append(cache)
+            lengths.append(len(token_ids))
+            next_tokens.append(next_token)
+
+        return (
+            admitted,
+            new_caches,
+            torch.tensor(lengths, dtype=torch.long, device=self.device),
+            torch.tensor(next_tokens, dtype=torch.long, device=self.device),
+        )
+
+    def _decode_generated_ids(self, generated_ids: list[int]) -> str:
+        return self.tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
 
     def _weight(self, name_key: str) -> torch.Tensor:
         return self.weights[name_key]
@@ -175,6 +345,35 @@ class StudentEngine:
         if self.bos_token_id is not None:
             return [int(self.bos_token_id)]
         return [self.eos_token_id]
+
+    def _build_template_prefix_token_ids(self) -> tuple[int, ...]:
+        samples = ["A", "z", "7"]
+        tokenized_samples: list[list[int]] = []
+        for sample in samples:
+            text = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": sample}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            encoded = self.tokenizer(text, add_special_tokens=False)
+            tokenized_samples.append([int(item) for item in encoded.get("input_ids", [])])
+        prefix_len = self._common_prefix_length(tokenized_samples)
+        return tuple(tokenized_samples[0][:prefix_len])
+
+    def _common_prefix_length(self, tokenized: list[list[int]]) -> int:
+        if not tokenized:
+            return 0
+        shortest = min(len(token_ids) for token_ids in tokenized)
+        prefix_len = 0
+        for index in range(shortest):
+            token_id = tokenized[0][index]
+            if any(other[index] != token_id for other in tokenized[1:]):
+                break
+            prefix_len += 1
+        return prefix_len
+
+    def _is_prefix(self, prefix_key: tuple[int, ...], token_ids: list[int] | tuple[int, ...]) -> bool:
+        return len(prefix_key) <= len(token_ids) and tuple(token_ids[: len(prefix_key)]) == prefix_key
 
     def _rotary_cos_sin(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(device=self.device, dtype=torch.float32)
@@ -206,24 +405,56 @@ class StudentEngine:
         k: torch.Tensor,
         v: torch.Tensor,
         is_prefill: bool,
+        query_start: int = 0,
     ) -> torch.Tensor:
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
         if self.attn_implementation == "sdpa":
-            return F.scaled_dot_product_attention(q, k, v, is_causal=is_prefill)
+            if not is_prefill:
+                return F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            if query_start == 0 and q.shape[-2] == k.shape[-2]:
+                return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            attn_mask = self._causal_suffix_mask(
+                q.shape[-2],
+                k.shape[-2],
+                int(query_start),
+                q.dtype,
+                q.device,
+            )
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
 
         scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
         if is_prefill:
-            seq_len = q.shape[-2]
-            mask = torch.full(
-                (seq_len, seq_len),
-                torch.finfo(scores.dtype).min,
-                dtype=scores.dtype,
-                device=scores.device,
+            mask = self._causal_suffix_mask(
+                q.shape[-2],
+                k.shape[-2],
+                int(query_start),
+                scores.dtype,
+                scores.device,
             )
-            scores = scores + torch.triu(mask, diagonal=1)[None, None, :, :]
+            scores = scores + mask
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         return torch.matmul(probs, v)
+
+    def _causal_suffix_mask(
+        self,
+        query_len: int,
+        key_len: int,
+        query_start: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        query_positions = torch.arange(
+            query_start,
+            query_start + query_len,
+            dtype=torch.long,
+            device=device,
+        ).view(query_len, 1)
+        key_positions = torch.arange(key_len, dtype=torch.long, device=device).view(1, key_len)
+        invalid = key_positions > query_positions
+        mask = torch.zeros((query_len, key_len), dtype=dtype, device=device)
+        mask = mask.masked_fill(invalid, torch.finfo(dtype).min)
+        return mask.view(1, 1, query_len, key_len)
 
     def _batch_decode_attention(
         self,
@@ -264,6 +495,7 @@ class StudentEngine:
             full_k, full_v = k, v
             layer_cache = (full_k, full_v, seq_len)
             is_prefill = seq_len > 1
+            query_start = 0
         else:
             past_k, past_v, past_len = past
             next_len = past_len + seq_len
@@ -277,9 +509,10 @@ class StudentEngine:
                 full_k = torch.cat((past_k[:, :, :past_len, :], k), dim=2)
                 full_v = torch.cat((past_v[:, :, :past_len, :], v), dim=2)
                 layer_cache = (full_k, full_v, next_len)
-            is_prefill = False
+            is_prefill = seq_len > 1
+            query_start = past_len
 
-        attn_output = self._attention(q, full_k, full_v, is_prefill=is_prefill)
+        attn_output = self._attention(q, full_k, full_v, is_prefill=is_prefill, query_start=query_start)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
         return self._linear(attn_output, f"{prefix}.o_proj.weight"), layer_cache
@@ -397,11 +630,131 @@ class StudentEngine:
             reserved.append((key_buffer, value_buffer, used_tokens))
         return reserved
 
+    def _copy_cache_with_capacity(
+        self,
+        cache: list[tuple[torch.Tensor, torch.Tensor, int]],
+        total_tokens: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+        copied: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        for key_cache, value_cache, used_tokens in cache:
+            capacity = max(int(total_tokens), int(used_tokens))
+            key_buffer = key_cache.new_empty(
+                key_cache.shape[0],
+                key_cache.shape[1],
+                capacity,
+                key_cache.shape[3],
+            )
+            value_buffer = value_cache.new_empty(
+                value_cache.shape[0],
+                value_cache.shape[1],
+                capacity,
+                value_cache.shape[3],
+            )
+            key_buffer[:, :, :used_tokens, :] = key_cache[:, :, :used_tokens, :]
+            value_buffer[:, :, :used_tokens, :] = value_cache[:, :, :used_tokens, :]
+            copied.append((key_buffer, value_buffer, used_tokens))
+        return copied
+
+    def _touch_prefix_cache(self, prefix_key: tuple[int, ...]) -> None:
+        self.prefix_cache_order = [key for key in self.prefix_cache_order if key != prefix_key]
+        self.prefix_cache_order.append(prefix_key)
+
+    def _evict_prefix_cache(self) -> None:
+        while len(self.prefix_cache) > self.max_prefix_cache_entries:
+            victim = next(
+                (key for key in self.prefix_cache_order if key not in self.pinned_prefix_keys),
+                None,
+            )
+            if victim is None:
+                return
+            self.prefix_cache.pop(victim, None)
+            self.prefix_cache_order = [key for key in self.prefix_cache_order if key != victim]
+
+    def _get_or_build_prefix_cache(
+        self,
+        prefix_key: tuple[int, ...],
+        pinned: bool = False,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, int]]] | None:
+        if not prefix_key:
+            return None
+        if len(prefix_key) > self.max_cached_prefix_tokens:
+            prefix_key = prefix_key[: self.max_cached_prefix_tokens]
+
+        existing = self.prefix_cache.get(prefix_key)
+        if existing is not None:
+            if pinned:
+                self.pinned_prefix_keys.add(prefix_key)
+            self._touch_prefix_cache(prefix_key)
+            return existing
+
+        input_ids = torch.tensor([list(prefix_key)], dtype=torch.long, device=self.device)
+        hidden_states, cache = self._forward_tokens(input_ids, start_position=0, cache=None)
+        used_tokens = len(prefix_key)
+        compact_cache = [
+            (
+                key_cache[:, :, :used_tokens, :].contiguous(),
+                value_cache[:, :, :used_tokens, :].contiguous(),
+                used_tokens,
+            )
+            for key_cache, value_cache, _ in cache
+        ]
+        entry = (hidden_states[:, -1:, :].contiguous(), compact_cache)
+        self.prefix_cache[prefix_key] = entry
+        if pinned:
+            self.pinned_prefix_keys.add(prefix_key)
+        self._touch_prefix_cache(prefix_key)
+        self._evict_prefix_cache()
+        return entry
+
+    def _ensure_template_prefix_cache(self) -> None:
+        if self.template_prefix_token_ids:
+            self._get_or_build_prefix_cache(self.template_prefix_token_ids, pinned=True)
+
+    def _best_cached_prefix_key(self, token_ids: list[int]) -> tuple[int, ...] | None:
+        best_key: tuple[int, ...] | None = None
+        for prefix_key in self.prefix_cache:
+            if best_key is not None and len(prefix_key) <= len(best_key):
+                continue
+            if self._is_prefix(prefix_key, token_ids):
+                best_key = prefix_key
+        if best_key is not None:
+            self._touch_prefix_cache(best_key)
+        return best_key
+
+    def _prepare_batch_prefix_cache(self, tokenized: list[list[int]]) -> None:
+        self._ensure_template_prefix_cache()
+        if len(tokenized) < 2:
+            return
+        prefix_len = min(
+            self._common_prefix_length(tokenized),
+            self.max_cached_prefix_tokens,
+        )
+        if prefix_len >= self.batch_prefix_min_tokens:
+            self._get_or_build_prefix_cache(tuple(tokenized[0][:prefix_len]))
+
     def _prefill_single(
         self,
         token_ids: list[int],
         total_capacity: int,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor, int]]]:
+        total_capacity = max(int(total_capacity), len(token_ids))
+        self._ensure_template_prefix_cache()
+        prefix_key = self._best_cached_prefix_key(token_ids)
+        if prefix_key is not None:
+            cached_hidden, cached_cache = self.prefix_cache[prefix_key]
+            prefix_len = len(prefix_key)
+            cache = self._copy_cache_with_capacity(cached_cache, total_capacity)
+            suffix_ids = token_ids[prefix_len:]
+            if not suffix_ids:
+                return cached_hidden, cache
+            input_ids = torch.tensor([suffix_ids], dtype=torch.long, device=self.device)
+            hidden_states, cache = self._forward_tokens(
+                input_ids,
+                start_position=prefix_len,
+                cache=cache,
+            )
+            return hidden_states, cache
+
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         hidden_states, cache = self._forward_tokens(input_ids, start_position=0, cache=None)
         return hidden_states, self._reserve_cache(cache, total_capacity)
@@ -433,6 +786,62 @@ class StudentEngine:
                 value_cache[batch_index, :, :used_tokens, :] = value_source[0, :, :used_tokens, :]
             merged.append((key_cache, value_cache))
         return merged
+
+    def _append_active_cache_rows(
+        self,
+        active_cache: list[tuple[torch.Tensor, torch.Tensor]] | None,
+        new_caches: list[list[tuple[torch.Tensor, torch.Tensor, int]]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if active_cache is None:
+            target_capacity = max(cache[0][0].shape[2] for cache in new_caches)
+            return self._merge_caches(new_caches, target_capacity)
+
+        old_batch = active_cache[0][0].shape[0]
+        new_batch = len(new_caches)
+        target_capacity = max(
+            active_cache[0][0].shape[2],
+            max(cache[0][0].shape[2] for cache in new_caches),
+        )
+        merged: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_index in range(self.num_layers):
+            old_key, old_value = active_cache[layer_index]
+            key_cache = old_key.new_empty(
+                old_batch + new_batch,
+                old_key.shape[1],
+                target_capacity,
+                old_key.shape[3],
+            )
+            value_cache = old_value.new_empty(
+                old_batch + new_batch,
+                old_value.shape[1],
+                target_capacity,
+                old_value.shape[3],
+            )
+            key_cache[:old_batch, :, : old_key.shape[2], :] = old_key
+            value_cache[:old_batch, :, : old_value.shape[2], :] = old_value
+            for offset, cache in enumerate(new_caches):
+                key_source, value_source, used_tokens = cache[layer_index]
+                row = old_batch + offset
+                key_cache[row, :, :used_tokens, :] = key_source[0, :, :used_tokens, :]
+                value_cache[row, :, :used_tokens, :] = value_source[0, :, :used_tokens, :]
+            merged.append((key_cache, value_cache))
+        return merged
+
+    def _select_active_cache_rows(
+        self,
+        active_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        keep_positions: list[int],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        keep_tensor = torch.tensor(keep_positions, dtype=torch.long, device=self.device)
+        selected: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for key_cache, value_cache in active_cache:
+            selected.append(
+                (
+                    key_cache.index_select(0, keep_tensor).contiguous(),
+                    value_cache.index_select(0, keep_tensor).contiguous(),
+                )
+            )
+        return selected
 
     def _next_token(self, hidden_states: torch.Tensor) -> int:
         return int(self._next_tokens(hidden_states).item())
@@ -554,6 +963,7 @@ class StudentEngine:
 
         prompt_lengths = [len(token_ids) for token_ids in tokenized]
         total_capacity = max(prompt_lengths) + int(max_new_tokens)
+        self._prepare_batch_prefix_cache(tokenized)
 
         last_hidden_states: list[torch.Tensor] = []
         single_caches: list[list[tuple[torch.Tensor, torch.Tensor, int]]] = []
@@ -589,13 +999,11 @@ class StudentEngine:
         if max_new_tokens <= 0:
             return ""
 
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        hidden_states, cache = self._forward_tokens(input_ids, start_position=0, cache=None)
-        cache = self._reserve_cache(cache, input_ids.shape[1] + max_new_tokens)
+        hidden_states, cache = self._prefill_single(token_ids, len(token_ids) + max_new_tokens)
         next_token = self._next_token(hidden_states)
         generated_ids = [next_token]
 
-        current_position = input_ids.shape[1]
+        current_position = len(token_ids)
         for _ in range(max_new_tokens - 1):
             step_ids = torch.tensor([[next_token]], dtype=torch.long, device=self.device)
             hidden_states, cache = self._forward_tokens(step_ids, current_position, cache)
