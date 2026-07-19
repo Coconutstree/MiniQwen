@@ -1,0 +1,150 @@
+{"kind":"deck","id":"pr/p64yd8","name":"Deck"}
+{"kind":"layout","layoutId":"4c885261-1d97-4551-9484-b6db45baa917","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"df3a893a-75ee-4ead-8d8e-82461513fcaa","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/1x4k1j","slide":1,"title":"MiniQwen","textShapes":5}
+{"kind":"textbox","id":"sh/3i1sbu5c","slide":1,"text":"MiniQwen","textPreview":"MiniQwen","textChars":8,"textLines":1,"bbox":[41.33,41.18,598.67,68.15]}
+{"kind":"textbox","id":"sh/4jatkz6x","slide":1,"text":"推理优化\n实现报告","textPreview":"推理优化 | 实现报告","textChars":9,"textLines":2,"bbox":[41.33,168,790,245]}
+{"kind":"textbox","id":"sh/pkjad4ni","slide":1,"text":"Qwen2.5-0.5B-Instruct 手写推理引擎\nFinal Score 83.44 / 100 | 2026-07-19","textPreview":"Qwen2.5-0.5B-Instruct 手写推理引擎 | Final Score 83.44 / 100 | 2026-07-19","textChars":65,"textLines":2,"bbox":[41.33,497.87,760,113.41]}
+{"kind":"shape","id":"sh/qlsbm9o3","slide":1,"name":"score-panel","bbox":[896,182,275,178]}
+{"kind":"textbox","id":"sh/r61cfu5o","slide":1,"text":"83.44","textPreview":"83.44","textChars":5,"textLines":1,"bbox":[926,210,220,78]}
+{"kind":"textbox","id":"sh/c7atoz69","slide":1,"text":"/ 100","textPreview":"/ 100","textChars":5,"textLines":1,"bbox":[926,292,220,34]}
+{"kind":"shape","id":"sh/d8juh4nu","slide":1,"bbox":[41.33,646,1197,1.4]}
+{"kind":"notes","id":"nt/1x4k1j","slide":1,"text":""}
+{"kind":"slide","id":"sl/mtk26p","slide":2,"title":"已有配置决定了优化边界","textShapes":3}
+{"kind":"textbox","id":"sh/gb2pcvuh","slide":2,"text":"已有配置决定了优化边界","textPreview":"已有配置决定了优化边界","textChars":11,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"textbox","id":"sh/vat8jqdw","slide":2,"text":"运行主路径固定为 GPU + float16 + SDPA；12G 显存约束下，当前实现实际 peak 仅约 1.35 GB。","textPreview":"运行主路径固定为 GPU + float16 + SDPA；12G 显存约束下，当前实现实际 peak 仅约 1.35 GB。","textChars":63,"textLines":1,"bbox":[42,124,1120,46]}
+{"kind":"textbox","id":"sh/t8rqhgvq","slide":2,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"table","id":"tb/f2d0jitc","slide":2,"name":"","rows":8,"cols":3,"preview":"配置项 | 取值 | 对优化的含义","bbox":[41.33,195,1197.33,430]}
+{"kind":"notes","id":"nt/mtk26p","slide":2,"text":""}
+{"kind":"slide","id":"sl/gpwxxx","slide":3,"title":"接口和文件边界先把实现收紧","textShapes":6}
+{"kind":"textbox","id":"sh/ylo3yhcz","slide":3,"text":"接口和文件边界先把实现收紧","textPreview":"接口和文件边界先把实现收紧","textChars":13,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"shape","id":"sh/lof2twbq","slide":3,"name":"left-surface","bbox":[41.33,186,581.33,405]}
+{"kind":"shape","id":"sh/kn6l0ru5","slide":3,"name":"right-surface","bbox":[657.75,186,581.33,405]}
+{"kind":"textbox","id":"sh/7qhkvmtg","slide":3,"text":"文件依据","textPreview":"文件依据","textChars":4,"textLines":1,"bbox":[73,214,500,34]}
+{"kind":"textbox","id":"sh/6po321cv","slide":3,"text":"student_engine.py\n推理引擎主实现：forward、KV cache、batch decode、serving 调度\n\nutils/load_weights.py\n读取 config 与 safetensors，合并 state_dict\n\nvalidate_engine.py / run_inference_benchmark.py\n约束检查与完整评测入口","textPreview":"student_engine.py | 推理引擎主实现：forward、KV cache、batch decode、serving 调度 |  | utils/load_weights.py | 读取 config 与 safetensors，合并 state_dict |...","textChars":188,"textLines":8,"bbox":[73,260,500,284]}
+{"kind":"textbox","id":"sh/tszmxwbm","slide":3,"text":"三类接口","textPreview":"三类接口","textChars":4,"textLines":1,"bbox":[690,214,500,34]}
+{"kind":"textbox","id":"sh/8rql4ru1","slide":3,"text":"__init__\n固定 seed；加载 tokenizer、config、权重；解析 Qwen2 结构参数；预计算 RoPE inv_freq。\n\ngenerate\n统一进入长度感知分组，执行 greedy continuation，保持输入输出顺序一致。\n\nserve_requests\n按 max_new_tokens 分组后生成，再按原始 index 回填。","textPreview":"__init__ | 固定 seed；加载 tokenizer、config、权重；解析 Qwen2 结构参数；预计算 RoPE inv_freq。 |  | generate | 统一进入长度感知分组，执行 greedy continuation，保持输入输出顺序一致。 ...","textChars":182,"textLines":8,"bbox":[690,260,500,294]}
+{"kind":"textbox","id":"sh/nudkj2tc","slide":3,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"notes","id":"nt/gpwxxx","slide":3,"text":""}
+{"kind":"slide","id":"sl/fgdfa6","slide":4,"title":"手写 forward 先保证 strict track 的正确性","textShapes":22}
+{"kind":"textbox","id":"sh/w36p8ryp","slide":4,"text":"手写 forward 先保证 strict track 的正确性","textPreview":"手写 forward 先保证 strict track 的正确性","textChars":32,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"textbox","id":"sh/v2x8zmh4","slide":4,"text":"核心路径复刻 Qwen2 decoder block；不依赖 Transformers 模型 forward。","textPreview":"核心路径复刻 Qwen2 decoder block；不依赖 Transformers 模型 forward。","textChars":55,"textLines":1,"bbox":[42,124,1040,42]}
+{"kind":"shape","id":"sh/a1o76hgj","slide":4,"name":"forward-step","bbox":[52,232,184,300]}
+{"kind":"textbox","id":"sh/5szq5wz6","slide":4,"text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[70,254,148,34]}
+{"kind":"textbox","id":"sh/k7qpcbyl","slide":4,"text":"Token Embedding","textPreview":"Token Embedding","textChars":15,"textLines":1,"bbox":[70,310,148,70]}
+{"kind":"textbox","id":"sh/j6h836hg","slide":4,"text":"读取 embedding weight，形成 decoder 输入。","textPreview":"读取 embedding weight，形成 decoder 输入。","textChars":34,"textLines":1,"bbox":[70,398,148,96]}
+{"kind":"shape","id":"sh/i587a1gv","slide":4,"name":"forward-step","bbox":[254,232,184,300]}
+{"kind":"textbox","id":"sh/lwv6tcz2","slide":4,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[272,254,148,34]}
+{"kind":"textbox","id":"sh/0bmp07yh","slide":4,"text":"RMSNorm + RoPE","textPreview":"RMSNorm + RoPE","textChars":14,"textLines":1,"bbox":[272,310,148,70]}
+{"kind":"textbox","id":"sh/i943e1cb","slide":4,"text":"按当前位置生成 cos / sin，并旋转 Q/K。","textPreview":"按当前位置生成 cos / sin，并旋转 Q/K。","textChars":26,"textLines":1,"bbox":[272,398,148,96]}
+{"kind":"shape","id":"sh/jadknmdw","slide":4,"name":"forward-step","bbox":[456,232,184,300]}
+{"kind":"textbox","id":"sh/4bmlgruh","slide":4,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[474,254,148,34]}
+{"kind":"textbox","id":"sh/5cv2pwv2","slide":4,"text":"Q/K/V Projection","textPreview":"Q/K/V Projection","textChars":16,"textLines":1,"bbox":[474,310,148,70]}
+{"kind":"textbox","id":"sh/6x43i1cn","slide":4,"text":"按 GQA 结构 reshape heads 与 KV heads。","textPreview":"按 GQA 结构 reshape heads 与 KV heads。","textChars":34,"textLines":1,"bbox":[474,398,148,96]}
+{"kind":"shape","id":"sh/ryd4r6d8","slide":4,"name":"forward-step","bbox":[658,232,184,300]}
+{"kind":"textbox","id":"sh/szmlkbud","slide":4,"text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[676,254,148,34]}
+{"kind":"textbox","id":"sh/t0fmtgvy","slide":4,"text":"SDPA Attention","textPreview":"SDPA Attention","textChars":14,"textLines":1,"bbox":[676,310,148,70]}
+{"kind":"textbox","id":"sh/e1o3mlcj","slide":4,"text":"prefill 使用 causal attention，decode 读取 cache。","textPreview":"prefill 使用 causal attention，decode 读取 cache。","textChars":44,"textLines":1,"bbox":[676,398,148,96]}
+{"kind":"shape","id":"sh/f2x4v6d4","slide":4,"name":"forward-step","bbox":[860,232,184,300]}
+{"kind":"textbox","id":"sh/b6xkjq9c","slide":4,"text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[878,254,148,34]}
+{"kind":"textbox","id":"sh/q5ojalsr","slide":4,"text":"SwiGLU MLP","textPreview":"SwiGLU MLP","textChars":10,"textLines":1,"bbox":[878,310,148,70]}
+{"kind":"textbox","id":"sh/x8z2lgr2","slide":4,"text":"silu(gate) * up，再经 down_proj 回到 residual。","textPreview":"silu(gate) * up，再经 down_proj 回到 residual。","textChars":41,"textLines":1,"bbox":[878,398,148,96]}
+{"kind":"shape","id":"sh/c7qlcbax","slide":4,"name":"forward-step","bbox":[1062,232,184,300]}
+{"kind":"textbox","id":"sh/32xkf690","slide":4,"text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[1080,254,148,34]}
+{"kind":"textbox","id":"sh/21oj61sf","slide":4,"text":"Tied LM Head","textPreview":"Tied LM Head","textChars":12,"textLines":1,"bbox":[1080,310,148,70]}
+{"kind":"textbox","id":"sh/p4f2hgr6","slide":4,"text":"final RMSNorm 后复用 embedding weight，argmax 取 token。","textPreview":"final RMSNorm 后复用 embedding weight，argmax 取 token。","textChars":50,"textLines":1,"bbox":[1080,398,148,96]}
+{"kind":"textbox","id":"sh/o3618bal","slide":4,"text":"结果：输出只包含 continuation，不做采样；max_new_tokens <= 0 时返回空 continuation。","textPreview":"结果：输出只包含 continuation，不做采样；max_new_tokens <= 0 时返回空 continuation。","textChars":65,"textLines":1,"bbox":[70,585,1020,38]}
+{"kind":"textbox","id":"sh/fedkb694","slide":4,"text":"04","textPreview":"04","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"notes","id":"nt/fgdfa6","slide":4,"text":""}
+{"kind":"slide","id":"sl/s36q21","slide":5,"title":"KV cache 把 decode 改成增量写入","textShapes":20}
+{"kind":"textbox","id":"sh/w32p8jat","slide":5,"text":"KV cache 把 decode 改成增量写入","textPreview":"KV cache 把 decode 改成增量写入","textChars":24,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"shape","id":"sh/v2tofe98","slide":5,"bbox":[70,354,1120,1.2]}
+{"kind":"textbox","id":"sh/a1k769sn","slide":5,"text":"01","textPreview":"01","textChars":2,"textLines":1,"bbox":[72,232,58,36]}
+{"kind":"textbox","id":"sh/5sv6l8ra","slide":5,"text":"Prefill","textPreview":"Prefill","textChars":7,"textLines":1,"bbox":[136,232,251,34]}
+{"kind":"textbox","id":"sh/k7mpc3ap","slide":5,"text":"完整 prompt 一次 forward，保留每层 K/V。","textPreview":"完整 prompt 一次 forward，保留每层 K/V。","textChars":30,"textLines":1,"bbox":[136,274,251,56]}
+{"kind":"textbox","id":"sh/j6dojy9k","slide":5,"text":"02","textPreview":"02","textChars":2,"textLines":1,"bbox":[452,232,58,36]}
+{"kind":"textbox","id":"sh/i547atsz","slide":5,"text":"Reserve","textPreview":"Reserve","textChars":7,"textLines":1,"bbox":[516,232,251,34]}
+{"kind":"textbox","id":"sh/1wr694r6","slide":5,"text":"_reserve_cache 预分配 prompt + max_new_tokens 容量。","textPreview":"_reserve_cache 预分配 prompt + max_new_tokens 容量。","textChars":46,"textLines":1,"bbox":[516,274,251,56]}
+{"kind":"textbox","id":"sh/0bi50zal","slide":5,"text":"03","textPreview":"03","textChars":2,"textLines":1,"bbox":[858,232,58,36]}
+{"kind":"textbox","id":"sh/qh8vq5w7","slide":5,"text":"Decode","textPreview":"Decode","textChars":6,"textLines":1,"bbox":[922,232,251,34]}
+{"kind":"textbox","id":"sh/rihczaxc","slide":5,"text":"每步只输入上一个 token，把新 K/V 原地写入 cache。","textPreview":"每步只输入上一个 token，把新 K/V 原地写入 cache。","textChars":33,"textLines":1,"bbox":[922,274,251,56]}
+{"kind":"textbox","id":"sh/sjadsfex","slide":5,"text":"批量 cache 形状","textPreview":"批量 cache 形状","textChars":11,"textLines":1,"bbox":[78,420,320,32]}
+{"kind":"textbox","id":"sh/dkje1kfi","slide":5,"text":"[batch, num_kv_heads, total_capacity, head_dim]","textPreview":"[batch, num_kv_heads, total_capacity, head_dim]","textChars":47,"textLines":1,"bbox":[78,464,610,48]}
+{"kind":"textbox","id":"sh/elsvupw3","slide":5,"text":"valid_lengths mask 会屏蔽 padding 与未写入区域，保证变长 batch 的 attention 正确性。","textPreview":"valid_lengths mask 会屏蔽 padding 与未写入区域，保证变长 batch 的 attention 正确性。","textChars":65,"textLines":1,"bbox":[78,522,620,64]}
+{"kind":"shape","id":"sh/fm1w3uxo","slide":5,"name":"metric-card","bbox":[760,420,180,145]}
+{"kind":"textbox","id":"sh/0nadwfe9","slide":5,"text":"0.00 MB","textPreview":"0.00 MB","textChars":7,"textLines":1,"bbox":[786,448,128,70]}
+{"kind":"textbox","id":"sh/1oje5kvu","slide":5,"text":"cache growth","textPreview":"cache growth","textChars":12,"textLines":1,"bbox":[786,524,128,38]}
+{"kind":"textbox","id":"sh/2psvypwf","slide":5,"text":"每 100 tokens 动态增长","textPreview":"每 100 tokens 动态增长","textChars":17,"textLines":1,"bbox":[786,564,128,70]}
+{"kind":"shape","id":"sh/nq1w7udk","slide":5,"name":"metric-card","bbox":[970,420,180,145]}
+{"kind":"textbox","id":"sh/julcvuts","slide":5,"text":"1.35 GB","textPreview":"1.35 GB","textChars":7,"textLines":1,"bbox":[996,448,128,70]}
+{"kind":"textbox","id":"sh/ytcvmpc7","slide":5,"text":"final peak","textPreview":"final peak","textChars":10,"textLines":1,"bbox":[996,524,128,38]}
+{"kind":"textbox","id":"sh/lg3ux4by","slide":5,"text":"全流程最高显存","textPreview":"全流程最高显存","textChars":7,"textLines":1,"bbox":[996,564,128,70]}
+{"kind":"textbox","id":"sh/kfudozud","slide":5,"text":"05","textPreview":"05","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"notes","id":"nt/s36q21","slide":5,"text":""}
+{"kind":"slide","id":"sl/61q48q","slide":6,"title":"Batch 与 serving 优化围绕少 padding、少空转","textShapes":11}
+{"kind":"textbox","id":"sh/7ehojaxg","slide":6,"text":"Batch 与 serving 优化围绕少 padding、少空转","textPreview":"Batch 与 serving 优化围绕少 padding、少空转","textChars":33,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"shape","id":"sh/8fqpsfe1","slide":6,"name":"batch-card","bbox":[41.33,210,581.33,172.5]}
+{"kind":"textbox","id":"sh/tgz6l0fm","slide":6,"text":"长度感知 batching","textPreview":"长度感知 batching","textChars":13,"textLines":1,"bbox":[69.33,234,525,34]}
+{"kind":"textbox","id":"sh/uh87u5wr","slide":6,"text":"先 token 化并按 prompt 长度排序；组内最长 / 最短比例阈值为 1.6。","textPreview":"先 token 化并按 prompt 长度排序；组内最长 / 最短比例阈值为 1.6。","textChars":43,"textLines":1,"bbox":[69.33,282,510,72]}
+{"kind":"shape","id":"sh/vih8naxc","slide":6,"name":"batch-card","bbox":[657.75,210,581.33,172.5]}
+{"kind":"textbox","id":"sh/gjapwfex","slide":6,"text":"单样本 prefill + 批量 decode","textPreview":"单样本 prefill + 批量 decode","textChars":23,"textLines":1,"bbox":[685.75,234,525,34]}
+{"kind":"textbox","id":"sh/hkjqpkfi","slide":6,"text":"prefill 避免不同长度 prompt padding；decode 合并 cache 后批量推进。","textPreview":"prefill 避免不同长度 prompt padding；decode 合并 cache 后批量推进。","textChars":52,"textLines":1,"bbox":[685.75,282,510,72]}
+{"kind":"shape","id":"sh/ils7ypw3","slide":6,"name":"batch-card","bbox":[41.33,421,581.33,172.5]}
+{"kind":"textbox","id":"sh/3m18ruxo","slide":6,"text":"有效长度 mask","textPreview":"有效长度 mask","textChars":9,"textLines":1,"bbox":[69.33,445,525,34]}
+{"kind":"textbox","id":"sh/f6t43q14","slide":6,"text":"_batch_decode_attention 只读每个样本已写入的有效 cache。","textPreview":"_batch_decode_attention 只读每个样本已写入的有效 cache。","textChars":43,"textLines":1,"bbox":[69.33,493,510,72]}
+{"kind":"shape","id":"sh/elk3ulkj","slide":6,"name":"batch-card","bbox":[657.75,421,581.33,172.5]}
+{"kind":"textbox","id":"sh/18bm50ja","slide":6,"text":"Serving 分组","textPreview":"Serving 分组","textChars":10,"textLines":1,"bbox":[685.75,445,525,34]}
+{"kind":"textbox","id":"sh/072lwv2p","slide":6,"text":"serve_requests 按 max_new_tokens 一级分组，减少同批 decode 步数不一致。","textPreview":"serve_requests 按 max_new_tokens 一级分组，减少同批 decode 步数不一致。","textChars":55,"textLines":1,"bbox":[685.75,493,510,72]}
+{"kind":"textbox","id":"sh/rit4zq18","slide":6,"text":"当前策略已经可用且保持输出顺序；短板是还没有动态接入 arrival_time_ms 的 continuous batching。","textPreview":"当前策略已经可用且保持输出顺序；短板是还没有动态接入 arrival_time_ms 的 continuous batching。","textChars":65,"textLines":1,"bbox":[72,624,1080,34]}
+{"kind":"textbox","id":"sh/qh03qlkn","slide":6,"text":"06","textPreview":"06","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"notes","id":"nt/61q48q","slide":6,"text":""}
+{"kind":"slide","id":"sl/l1yhsn","slide":7,"title":"优化点总览：收益集中在正确性、首 token 和内存","textShapes":2}
+{"kind":"textbox","id":"sh/na5gni50","slide":7,"text":"优化点总览：收益集中在正确性、首 token 和内存","textPreview":"优化点总览：收益集中在正确性、首 token 和内存","textChars":26,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"textbox","id":"sh/9cnypsnq","slide":7,"text":"07","textPreview":"07","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"table","id":"tb/x07itsru","slide":7,"name":"","rows":9,"cols":3,"preview":"优化点 | 实现方式 | 直接收益","bbox":[41.33,160,1197.33,470]}
+{"kind":"notes","id":"nt/l1yhsn","slide":7,"text":""}
+{"kind":"slide","id":"sl/jyv2by","slide":8,"title":"最终得分 83.44 / 100，质量和稳定性贡献最大","textShapes":15}
+{"kind":"textbox","id":"sh/u5cnix8b","slide":8,"text":"最终得分 83.44 / 100，质量和稳定性贡献最大","textPreview":"最终得分 83.44 / 100，质量和稳定性贡献最大","textChars":27,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"shape","id":"sh/w7u5k7qh","slide":8,"name":"metric-card","bbox":[785,172,205,150]}
+{"kind":"textbox","id":"sh/ja5ovmps","slide":8,"text":"28.50/30","textPreview":"28.50/30","textChars":8,"textLines":1,"bbox":[811,200,153,70]}
+{"kind":"textbox","id":"sh/i9cnmh87","slide":8,"text":"Long Context","textPreview":"Long Context","textChars":12,"textLines":1,"bbox":[811,276,153,38]}
+{"kind":"textbox","id":"sh/5cn6xc7y","slide":8,"text":"partial=0.950 exact=0.933","textPreview":"partial=0.950 exact=0.933","textChars":25,"textLines":1,"bbox":[811,316,153,70]}
+{"kind":"shape","id":"sh/4beporqd","slide":8,"name":"metric-card","bbox":[1015,172,205,150]}
+{"kind":"textbox","id":"sh/ry5ozmp4","slide":8,"text":"17.41/20","textPreview":"17.41/20","textChars":8,"textLines":1,"bbox":[1041,200,153,70]}
+{"kind":"textbox","id":"sh/qdw7qh8j","slide":8,"text":"TTFT","textPreview":"TTFT","textChars":4,"textLines":1,"bbox":[1041,276,153,38]}
+{"kind":"textbox","id":"sh/0j21s7i1","slide":8,"text":"avg=0.079s p95=0.231s","textPreview":"avg=0.079s p95=0.231s","textChars":21,"textLines":1,"bbox":[1041,316,153,70]}
+{"kind":"shape","id":"sh/1kbi1czm","slide":8,"name":"metric-card","bbox":[785,360,205,150]}
+{"kind":"textbox","id":"sh/ehkjqh0b","slide":8,"text":"10/10","textPreview":"10/10","textChars":5,"textLines":1,"bbox":[811,388,153,70]}
+{"kind":"textbox","id":"sh/fit0zmhg","slide":8,"text":"Robustness","textPreview":"Robustness","textChars":10,"textLines":1,"bbox":[811,464,153,38]}
+{"kind":"textbox","id":"sh/o721wrid","slide":8,"text":"runtime=1.000 valid=0.958","textPreview":"runtime=1.000 valid=0.958","textChars":25,"textLines":1,"bbox":[811,504,153,70]}
+{"kind":"shape","id":"sh/p8vi5wzy","slide":8,"name":"metric-card","bbox":[1015,360,205,150]}
+{"kind":"textbox","id":"sh/25kjuh07","slide":8,"text":"OK","textPreview":"OK","textChars":2,"textLines":1,"bbox":[1041,388,153,70]}
+{"kind":"textbox","id":"sh/n6t03mhs","slide":8,"text":"Realism Guard","textPreview":"Realism Guard","textChars":13,"textLines":1,"bbox":[1041,464,153,38]}
+{"kind":"textbox","id":"sh/cbm10ri9","slide":8,"text":"raw 与 before_cap 均为 83.44","textPreview":"raw 与 before_cap 均为 83.44","textChars":25,"textLines":1,"bbox":[1041,504,153,70]}
+{"kind":"textbox","id":"sh/xcv29wzu","slide":8,"text":"Serving 得分 8.75 / 15，是总分里最明显的后续提升空间。","textPreview":"Serving 得分 8.75 / 15，是总分里最明显的后续提升空间。","textChars":36,"textLines":1,"bbox":[785,548,435,44]}
+{"kind":"textbox","id":"sh/lsridwry","slide":8,"text":"08","textPreview":"08","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"chart","id":"ch/h4rutcfa","slide":8,"name":"","chartType":"bar","bbox":[60,178,675,390]}
+{"kind":"notes","id":"nt/jyv2by","slide":8,"text":""}
+{"kind":"slide","id":"sl/nvtsd1","slide":9,"title":"Suite 结果显示内存很稳，瓶颈转向 serving p95","textShapes":7}
+{"kind":"textbox","id":"sh/onm1kvid","slide":9,"text":"Suite 结果显示内存很稳，瓶颈转向 serving p95","textPreview":"Suite 结果显示内存很稳，瓶颈转向 serving p95","textChars":31,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"textbox","id":"sh/21kji507","slide":9,"text":"最高 peak / 12G","textPreview":"最高 peak / 12G","textChars":13,"textLines":1,"bbox":[72,565,190,24]}
+{"kind":"shape","id":"sh/10bi90zm","slide":9,"name":"bar-bg","bbox":[282,568,320,15]}
+{"kind":"shape","id":"sh/gz21gvi1","slide":9,"name":"bar-fill","bbox":[282,568,35.1,15]}
+{"kind":"textbox","id":"sh/fyt07qhg","slide":9,"text":"11%","textPreview":"11%","textChars":3,"textLines":1,"bbox":[612,563,70,26]}
+{"kind":"textbox","id":"sh/exkjel0v","slide":9,"text":"serving 得分","textPreview":"serving 得分","textChars":10,"textLines":1,"bbox":[72,606,190,24]}
+{"kind":"shape","id":"sh/twbi5gzq","slide":9,"name":"bar-bg","bbox":[282,609,320,15]}
+{"kind":"shape","id":"sh/sv21cbi5","slide":9,"name":"bar-fill","bbox":[282,609,186.67,15]}
+{"kind":"textbox","id":"sh/2t4nepgb","slide":9,"text":"58%","textPreview":"58%","textChars":3,"textLines":1,"bbox":[612,604,70,26]}
+{"kind":"textbox","id":"sh/3exonuhw","slide":9,"text":"显存余量充足，说明下一轮可以用更多缓存与 batch 策略换吞吐；尾延迟是主要问题。","textPreview":"显存余量充足，说明下一轮可以用更多缓存与 batch 策略换吞吐；尾延迟是主要问题。","textChars":42,"textLines":1,"bbox":[742,562,440,62]}
+{"kind":"textbox","id":"sh/4f65gfyh","slide":9,"text":"09","textPreview":"09","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"table","id":"tb/21ov65sv","slide":9,"name":"","rows":7,"cols":5,"preview":"Suite | 规模 / 有效率 | TPS / Latency | Batch 信息 | Peak 显存","bbox":[41.33,158,1197.33,360]}
+{"kind":"notes","id":"nt/nvtsd1","slide":9,"text":""}
+{"kind":"slide","id":"sl/jjkbno","slide":10,"title":"与 baseline 的差距定义了下一轮方向","textShapes":5}
+{"kind":"textbox","id":"sh/4fe1wbe1","slide":10,"text":"与 baseline 的差距定义了下一轮方向","textPreview":"与 baseline 的差距定义了下一轮方向","textChars":22,"textLines":1,"bbox":[41.33,36.12,1197.33,110]}
+{"kind":"shape","id":"sh/2tcju1wv","slide":10,"name":"next-panel","bbox":[676,166,520,400]}
+{"kind":"textbox","id":"sh/hs32lwva","slide":10,"text":"优先级建议","textPreview":"优先级建议","textChars":5,"textLines":1,"bbox":[710,198,430,34]}
+{"kind":"textbox","id":"sh/gru1srep","slide":10,"text":"1. 实现真正 continuous batching，按 arrival_time_ms 动态接入请求。\n\n2. 引入 prefix reuse，缓存共享 system prompt 与模板前缀 KV。\n\n3. 优化 prefill：同长度组内 batch prefill，必要时 chunked prefill。\n\n4. 减少 _repeat_kv 物理扩展，探索更适配 GQA 的 attention 写法。\n\n5. 在 12G 预算内升级 cache 管理和 CUDA 专用路径。","textPreview":"1. 实现真正 continuous batching，按 arrival_time_ms 动态接入请求。 |  | 2. 引入 prefix reuse，缓存共享 system prompt 与模板前缀 KV。 |  | 3. 优化 prefill：同长度组内 batch...","textChars":244,"textLines":9,"bbox":[710,250,430,264]}
+{"kind":"textbox","id":"sh/fqlkjmdk","slide":10,"text":"结论：当前版本已经完成 strict inference-engine 的核心能力；下一轮要把“可用的 batch”推进到“持续调度的 batch”。","textPreview":"结论：当前版本已经完成 strict inference-engine 的核心能力；下一轮要把“可用的 batch”推进到“持续调度的 batch”。","textChars":75,"textLines":1,"bbox":[72,595,1080,44]}
+{"kind":"textbox","id":"sh/upcjqhwz","slide":10,"text":"10","textPreview":"10","textChars":2,"textLines":1,"bbox":[1184.18,659.24,54.48,25.33]}
+{"kind":"chart","id":"ch/z69cnet0","slide":10,"name":"","chartType":"bar","bbox":[54,170,565,355]}
+{"kind":"notes","id":"nt/jjkbno","slide":10,"text":""}
